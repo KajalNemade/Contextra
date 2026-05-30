@@ -83,4 +83,3 @@ def _generate_onboarding(repo, files, project_summary: str) -> dict:
         "steps": steps,
         "entry_points": entry_points[:5],
     }
-

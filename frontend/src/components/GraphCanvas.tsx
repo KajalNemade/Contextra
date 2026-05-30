@@ -18,16 +18,9 @@ interface Props {
   onNodeClick?: (nodeId: string) => void
 }
 
-const LAYER_X: Record<string, number> = {
-  file:   0,
-  module: 600,
-}
-
 function buildLayout(graphData: GraphData): { nodes: Node[]; edges: Edge[] } {
-  // Group nodes by language for positioning
   const fileNodes   = graphData.nodes.filter(n => n.type === 'file')
   const moduleNodes = graphData.nodes.filter(n => n.type === 'module')
-
   const nodes: Node[] = []
 
   fileNodes.forEach((n, i) => {

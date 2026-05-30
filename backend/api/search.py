@@ -19,17 +19,10 @@ async def search(
     """
     Semantic repository search.
     """
-
-    repo = await session.get(
-        Repo,
-        repo_id,
-    )
+    repo = await session.get(Repo, repo_id)
 
     if not repo:
-        raise HTTPException(
-            404,
-            "Repo not found",
-        )
+        raise HTTPException(404, "Repo not found")
 
     if repo.status != RepoStatus.READY:
         raise HTTPException(
@@ -42,16 +35,13 @@ async def search(
 
     # Fallback keyword search
     if not query_vector:
-
         result = await session.execute(
             select(Function)
             .where(Function.repo_id == repo_id)
             .where(Function.name.ilike(f"%{q}%"))
             .limit(top_k)
         )
-
         fns = result.scalars().all()
-
         return {
             "query": q,
             "results": [
@@ -68,11 +58,11 @@ async def search(
 
     # Semantic vector search
     chunks = await search_chunks(
-    query_vector=query_vector,
-    repo_id=repo_id,
-    top_k=top_k,
-    query=q,
-)
+        query_vector=query_vector,
+        repo_id=repo_id,
+        top_k=top_k,
+        # query=q,
+    )
 
     return {
         "query": q,

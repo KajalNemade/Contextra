@@ -50,16 +50,8 @@ async def ask_question(
             detail=f"Repo not ready (status: {repo.status}). Wait for indexing.",
         )
 
-    print("=" * 50)
-    print("QUESTION:", request.question)
-
     # Embed question
     query_vector = await embed_text(request.question)
-
-    print("VECTOR EXISTS:", query_vector is not None)
-
-    if query_vector:
-        print("VECTOR SIZE:", len(query_vector))
 
     if query_vector is None:
         raise HTTPException(
@@ -67,24 +59,12 @@ async def ask_question(
             detail="Embedding service unavailable",
         )
 
-    # FIXED SEARCH CALL
+    # Search relevant chunks
     chunks = await search_chunks(
-    query_vector=query_vector,
-    repo_id=request.repo_id,
-    top_k=min(request.top_k, 8),
-    query=request.question,
+        query_vector=query_vector,
+        repo_id=request.repo_id,
+        top_k=min(request.top_k, 10),
     )
-
-    print("CHUNKS FOUND:", len(chunks))
-
-    for c in chunks[:3]:
-        print(
-            "FOUND:",
-            c.get("file_path"),
-            c.get("function_name"),
-        )
-
-    print("=" * 50)
 
     # Ask LLM
     try:
@@ -93,14 +73,10 @@ async def ask_question(
             chunks,
         )
 
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail="Failed to generate answer",
         )
 
     return AskResponse(

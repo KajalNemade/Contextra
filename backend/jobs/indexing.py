@@ -7,16 +7,15 @@ Runs in FastAPI BackgroundTasks (V1).
 from __future__ import annotations
 import os
 from datetime import datetime
-from typing import Optional
 import structlog
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
-from models.db import Repo, File, Function, Import, Summary, Job, Event, TokenUsage
+from models.db import Repo, File, Function, Import, Summary, Job, Event
 from models.db import RepoStatus, JobStatus
 from services.scanner import scan_directory, clone_repo, get_commit_hash, check_limits
-from services.sanitizer import is_blocked_file, scan_for_secrets
+from services.sanitizer import scan_for_secrets
 from parser.tree_parser import parse_file
 from graph.builder import build_graph_from_files
 from embeddings.engine import ensure_collection, embed_text, upsert_chunk, delete_repo_chunks
@@ -24,6 +23,10 @@ from services.llm_provider import summarize_code
 
 log = structlog.get_logger()
 
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
 
 async def _update_job(
     session: AsyncSession,
@@ -39,7 +42,12 @@ async def _update_job(
     await session.commit()
 
 
-async def _update_repo_status(session: AsyncSession, repo: Repo, status: RepoStatus, error: str = None):
+async def _update_repo_status(
+    session: AsyncSession,
+    repo: Repo,
+    status: RepoStatus,
+    error: str = None,
+):
     repo.status = status
     if error:
         repo.error_message = error
@@ -47,16 +55,28 @@ async def _update_repo_status(session: AsyncSession, repo: Repo, status: RepoSta
     await session.commit()
 
 
-async def _emit_event(session: AsyncSession, repo_id: int, event_type: str, data: dict = None):
-    event = Event(repo_id=repo_id, event_type=event_type, data=data or {})
+async def _emit_event(
+    session: AsyncSession,
+    repo_id: int,
+    event_type: str,
+    data: dict = None,
+):
+    event = Event(
+        repo_id=repo_id,
+        event_type=event_type,
+        data=data or {},
+    )
     session.add(event)
     await session.commit()
 
 
+# ─────────────────────────────────────────────────────────────
+# MAIN ENTRY
+# ─────────────────────────────────────────────────────────────
+
 async def run_indexing_pipeline(repo_id: int, session_factory):
     """
     Full indexing pipeline. Called as a background task.
-    session_factory: callable returning AsyncSession context manager.
     """
     async with session_factory() as session:
         repo = await session.get(Repo, repo_id)
@@ -69,6 +89,7 @@ async def run_indexing_pipeline(repo_id: int, session_factory):
             job_type="index",
             status=JobStatus.RUNNING,
             stage="starting",
+            progress=0,
             started_at=datetime.utcnow(),
         )
         session.add(job)
@@ -87,10 +108,16 @@ async def run_indexing_pipeline(repo_id: int, session_factory):
             await _emit_event(session, repo_id, "repo_index_failed", {"error": str(e)})
 
 
+# ─────────────────────────────────────────────────────────────
+# INTERNAL PIPELINE
+# ─────────────────────────────────────────────────────────────
+
 async def _run(repo: Repo, job: Job, session: AsyncSession):
     repo_id = repo.id
 
-    # ── Stage 1: Clone / locate ──────────────────────────────────────────────
+    # =========================================================
+    # STAGE 1 — CLONE
+    # =========================================================
     await _update_repo_status(session, repo, RepoStatus.INDEXING)
     await _update_job(session, job, "cloning", 5)
 
@@ -107,8 +134,9 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
 
     await _emit_event(session, repo_id, "repo_cloned", {"path": local_path})
 
-    # ── Stage 2: Scan ────────────────────────────────────────────────────────
-    await _update_repo_status(session, repo, RepoStatus.INDEXING)
+    # =========================================================
+    # STAGE 2 — SCAN
+    # =========================================================
     await _update_job(session, job, "scanning", 10)
 
     scan = scan_directory(local_path)
@@ -122,25 +150,29 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
     session.add(repo)
     await session.commit()
 
-    # ── Stage 3: Parse ───────────────────────────────────────────────────────
+    # =========================================================
+    # STAGE 3 — PARSE
+    # =========================================================
     await _update_repo_status(session, repo, RepoStatus.PARSING)
     await _update_job(session, job, "parsing", 20)
 
     file_imports_for_graph = []
     db_files = []
+    total_files = max(1, len(scan["files"]))
 
     for i, fi in enumerate(scan["files"]):
+
         # Secret scan
         try:
-            with open(fi["full_path"], "r", errors="ignore") as f:
+            with open(fi["full_path"], "r", encoding="utf-8", errors="ignore") as f:
                 raw = f.read()
-            secret_warnings = scan_for_secrets(raw)
-            if secret_warnings:
-                log.warning("Secrets detected", path=fi["path"], warnings=secret_warnings)
+            warnings = scan_for_secrets(raw)
+            if warnings:
+                log.warning("Secrets detected", path=fi["path"], warnings=warnings)
         except Exception:
             pass
 
-        # Parse
+        # Parse file
         parsed = parse_file(fi["full_path"], fi["path"], fi["language"])
 
         db_file = File(
@@ -152,8 +184,9 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
             file_hash=fi["file_hash"],
         )
         session.add(db_file)
-        await session.flush()  # get ID
+        await session.flush()
 
+        # Functions
         for fn in parsed.functions:
             db_fn = Function(
                 file_id=db_file.id,
@@ -169,6 +202,7 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
             )
             session.add(db_fn)
 
+        # Imports
         for imp in parsed.imports:
             db_imp = Import(
                 file_id=db_file.id,
@@ -187,22 +221,24 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
         })
         db_files.append((db_file, parsed))
 
+        # Batch commit every 20 files
         if i % 20 == 0:
             await session.commit()
-            progress = 20 + int((i / len(scan["files"])) * 20)
+            progress = 20 + int((i / total_files) * 20)
             await _update_job(session, job, "parsing", progress)
 
     await session.commit()
     await _emit_event(session, repo_id, "repo_parsed", {"file_count": len(db_files)})
 
-    # ── Stage 4: Graph ───────────────────────────────────────────────────────
+    # =========================================================
+    # STAGE 4 — GRAPH
+    # =========================================================
     await _update_repo_status(session, repo, RepoStatus.GRAPHING)
     await _update_job(session, job, "graphing", 45)
 
     dep_graph = build_graph_from_files(file_imports_for_graph)
     entry_points = dep_graph.get_entry_points()
 
-    # Mark entry point files
     for ep in entry_points:
         for db_file, _ in db_files:
             if db_file.path == ep:
@@ -212,7 +248,9 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
     await session.commit()
     await _emit_event(session, repo_id, "repo_graphed", {"entry_points": entry_points[:5]})
 
-    # ── Stage 5: Embed ───────────────────────────────────────────────────────
+    # =========================================================
+    # STAGE 5 — EMBED
+    # =========================================================
     await _update_repo_status(session, repo, RepoStatus.EMBEDDING)
     await _update_job(session, job, "embedding", 55)
 
@@ -220,15 +258,28 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
     await delete_repo_chunks(repo_id)
 
     embed_count = 0
+    total_functions = max(1, sum(len(p.functions) for _, p in db_files))
+
     for db_file, parsed in db_files:
+
+        # Function-level embeddings
         for fn in parsed.functions:
             body = fn.get("body", "")
             if not body or len(body) < 20:
                 continue
 
-            chunk_text = f"File: {db_file.path}\nFunction: {fn['name']}\n\n{body}"
-            print("EMBEDDING:", db_file.path, fn["name"],)
-            vector = await embed_text(chunk_text)
+            chunk_text = (
+                f"File: {db_file.path}\n"
+                f"Function: {fn['name']}\n\n"
+                f"{body[:4000]}"
+            )
+
+            try:
+                vector = await embed_text(chunk_text)
+            except Exception as e:
+                log.warning("Embedding failed", error=str(e))
+                continue
+
             if vector:
                 await upsert_chunk(
                     chunk_id=f"{repo_id}:{db_file.path}:{fn['name']}",
@@ -239,40 +290,99 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
                         "function_name": fn["name"],
                         "class_name": fn.get("class_name"),
                         "start_line": fn["start_line"],
-                        "body": body,
+                        "body": body[:1000],
                         "language": db_file.language,
                     },
                 )
                 embed_count += 1
-                print("UPSERTED:", fn["name"],)
 
+        # Progress update every 50 chunks
         if embed_count % 50 == 0 and embed_count > 0:
-            progress = 55 + int((embed_count / max(1, sum(len(p.functions) for _, p in db_files))) * 20)
+            progress = 55 + int((embed_count / total_functions) * 20)
             await _update_job(session, job, "embedding", min(75, progress))
 
     await _emit_event(session, repo_id, "repo_embedded", {"chunk_count": embed_count})
 
-    print("=" * 60)
-    print("EMBEDDING FINISHED")
-    print("TOTAL CHUNKS:", embed_count)
-    print("=" * 60)
+    # =========================================================
+    # STAGE 6 — SUMMARIZE
+    # =========================================================
+    await _update_repo_status(session, repo, RepoStatus.SUMMARIZING)
+    await _update_job(session, job, "summarizing", 80)
 
-    await _update_repo_status(session, repo, RepoStatus.EMBEDDING)
-    await _update_job(session, job, "embedding_complete", 90)
+    folder_contents: dict[str, list] = {}
 
-    print("=" * 60)
-    print("SETTING REPO READY")
-    print("REPO ID:", repo_id)
-    print("=" * 60)
+    for db_file, parsed in db_files:
+        if not parsed.functions:
+            continue
 
+        sample_fns = parsed.functions[:5]
+        sample_code = "\n\n".join(
+            f["body"][:500]
+            for f in sample_fns
+            if f.get("body")
+        )
+        sample_code = sample_code[:4000]
+
+        if not sample_code:
+            continue
+
+        try:
+            summary_text = await summarize_code(
+                sample_code,
+                context_hint=db_file.path,
+            )
+        except Exception as e:
+            log.warning("Summary failed", path=db_file.path, error=str(e))
+            continue
+
+        if summary_text:
+            summary = Summary(
+                repo_id=repo_id,
+                scope="file",
+                path=db_file.path,
+                content=summary_text,
+                provider="ollama",
+                model=settings.llm_model,
+            )
+            session.add(summary)
+
+            folder = "/".join(db_file.path.split("/")[:-1]) or "root"
+            folder_contents.setdefault(folder, []).append(summary_text[:200])
+
+    await session.commit()
+
+    # Project-level summary
+    if folder_contents:
+        project_blurb = "\n".join(
+            f"{folder}: {' '.join(summaries[:2])}"
+            for folder, summaries in list(folder_contents.items())[:10]
+        )
+        try:
+            project_summary = await summarize_code(
+                project_blurb,
+                context_hint=f"Project: {repo.name}",
+            )
+        except Exception as e:
+            log.warning("Project summary failed", error=str(e))
+            project_summary = None
+
+        if project_summary:
+            summary = Summary(
+                repo_id=repo_id,
+                scope="project",
+                content=project_summary,
+                provider="ollama",
+                model=settings.llm_model,
+            )
+            session.add(summary)
+            await session.commit()
+
+    await _emit_event(session, repo_id, "repo_summarized")
+
+    # =========================================================
+    # COMPLETE
+    # =========================================================
     await _update_repo_status(session, repo, RepoStatus.READY)
-
-    print("READY SAVED TO DATABASE")
-
-    job.status = JobStatus.DONE
-    job.progress = 100
-    job.stage = "complete"
-    job.ended_at = datetime.utcnow()
 
     job.status = JobStatus.DONE
     job.progress = 100
@@ -293,8 +403,4 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
         },
     )
 
-    log.info(
-        "Indexing complete",
-        repo_id=repo_id,
-        files=repo.file_count,
-    )
+    log.info("Indexing complete", repo_id=repo_id, files=repo.file_count)
