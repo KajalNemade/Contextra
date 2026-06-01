@@ -269,8 +269,12 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
                 continue
 
             chunk_text = (
-                f"File: {db_file.path}\n"
-                f"Function: {fn['name']}\n\n"
+                f"File Path: {db_file.path}\n"
+                f"Language: {db_file.language}\n"
+                f"Class: {fn.get('class_name', '')}\n"
+                f"Function: {fn['name']}\n"
+                f"Docstring: {fn.get('docstring', '')}\n"
+                f"Keywords: {db_file.path} {fn['name']}\n\n"
                 f"{body[:4000]}"
             )
 
@@ -290,7 +294,7 @@ async def _run(repo: Repo, job: Job, session: AsyncSession):
                         "function_name": fn["name"],
                         "class_name": fn.get("class_name"),
                         "start_line": fn["start_line"],
-                        "body": body[:1000],
+                        "body": body[:2000],
                         "language": db_file.language,
                     },
                 )

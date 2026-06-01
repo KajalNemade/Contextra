@@ -90,12 +90,54 @@ async def search_chunks(query_vector: List[float], repo_id: int, top_k: int = 5)
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
             query_filter=Filter(
-                must=[FieldCondition(key="repo_id", match=MatchValue(value=repo_id))]
+                must=[
+                    FieldCondition(
+                        key="repo_id",
+                        match=MatchValue(value=repo_id)
+                    )
+                ]
             ),
-            limit=top_k,
+            limit=max(top_k, 15),
         )
         await client.close()
-        return [{"score": r.score, **r.payload} for r in results]
+
+        reranked = []
+
+        for r in results:
+            score = r.score
+
+            path = (r.payload.get("file_path") or "").lower()
+            fn = (r.payload.get("function_name") or "").lower()
+
+            if "db" in path:
+                score += 0.05
+
+            if "database" in path:
+                score += 0.10
+
+            if "config" in path:
+                score += 0.10
+
+            if "connect" in fn:
+                score += 0.05
+
+            if "database" in fn:
+                score += 0.05
+
+            if "config" in fn:
+                score += 0.05
+
+            reranked.append({
+                "score": score,
+                **r.payload,
+            })
+
+        reranked.sort(
+            key=lambda x: x["score"],
+            reverse=True,
+        )
+
+        return reranked[:top_k]
     except Exception as e:
         log.error("Qdrant search failed", error=str(e))
         return []
