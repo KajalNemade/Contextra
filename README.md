@@ -70,11 +70,11 @@ docker exec -it dcrs_ollama ollama pull nomic-embed-text
 Copy `.env.example` to `.env` in the `backend/` folder:
 
 ```env
-DATABASE_URL=postgresql+psycopg://dcrs:dcrspass@postgres:5432/dcrs_db
-QDRANT_URL=http://qdrant:6333
-OLLAMA_URL=http://ollama:11434
-GEMINI_API_KEY=          # Optional — leave blank to use Ollama only
-REPOS_PATH=/tmp/dcrs_repos
+DATABASE_URL=postgresql+psycopg://dcrs:dcrspass@localhost:5432/dcrs_db
+QDRANT_URL=http://localhost:6333
+OLLAMA_URL=http://localhost:11434
+GEMINI_API_KEY=
+REPOS_PATH=./repos
 MAX_FILES=500
 MAX_LOC=100000
 ```
